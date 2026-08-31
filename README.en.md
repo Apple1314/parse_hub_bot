@@ -119,6 +119,7 @@ Configure **proxies** and **cookies** for each parser platform in `data/config/p
 # ═══════════════════════ Global default proxies ═══════════════════════
 # A platform without an individual proxy configuration uses the global default.
 # A proxy may be a single address (string) or a pool of addresses (list, selected at random).
+# Supported schemes: http://, https://, socks5://, socks5h://
 
 default_parser_proxies: http://127.0.0.1:7890        # Parser proxy (single)
 default_downloader_proxies: # Downloader proxy (pool)
