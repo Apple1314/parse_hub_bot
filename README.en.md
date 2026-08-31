@@ -63,6 +63,7 @@
 | **Xiaoheihe**   |  ✅   |     ✅      |                          |
 | **Snapchat**    |  ✅   |             |                          |
 | **Zhihu**       |  ✅   |     ✅      | 🐶 Q&A, columns, circles |
+| **Douban**      |  ✅   |     ✅      |     👥 Group topics      |
 
 > 🔧 More platforms are being added continuously...
 
@@ -179,6 +180,7 @@ Direct connection (no proxy)
 | `xiaoheihe` | Xiaoheihe   |
 | `snapchat`  | Snapchat    |
 | `zhihu`     | Zhihu       |
+| `douban`    | Douban      |
 
 ### 🍪 Platforms Supporting Cookies
 
@@ -192,6 +194,7 @@ Direct connection (no proxy)
 - `Kuaishou`
 - `Xiaohongshu`
 - `Zhihu`
+- `Douban`
 
 ### 📌 Configuration Examples
 
