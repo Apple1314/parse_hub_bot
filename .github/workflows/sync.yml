@@ -23,6 +23,3 @@ jobs:
           git fetch upstream
           git merge upstream/main --no-edit
           git push origin main
-
-      - name: Keep workflow alive
-        uses: gautamkrishnar/keepalive-workflow@v2
