@@ -1,14 +1,27 @@
 from typing import Self
 
 from parsehub import ParseHub, Platform
+from parsehub.errors import ParseHubError
 from parsehub.types import (
     AnyParseResult,
+    ContentUnavailableError,
+    FallbackAttempt,
 )
 
 from core import pl_cfg
 from log import logger
 
+from .cookie_health import cookie_health
+
 logger = logger.bind(name="ParseService")
+
+
+def _used_cookie(e: BaseException) -> bool:
+    return isinstance(e, ParseHubError) and bool(e.cookie)
+
+
+def _cookie_failure(pr: AnyParseResult) -> FallbackAttempt | None:
+    return next((a for a in pr.fallback_errors if _used_cookie(a.error)), None)
 
 
 class ParseService:
@@ -34,18 +47,47 @@ class ParseService:
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):
+            cookie = pl_cfg.roll_cookie(p.id)
+            cookie_value = cookie.get_secret_value() if cookie else None
             try:
-                cookie = pl_cfg.roll_cookie(p.id)
                 proxy = pl_cfg.roll_parser_proxy(p.id)
                 logger.debug(f"使用配置: proxy={proxy}, cookie={cookie}, attempt={attempt}/{max_retries}")
-                pr = await self.parser.parse(url, cookie=cookie.get_secret_value() if cookie else None, proxy=proxy)
+                pr = await self.parser.parse(url, cookie=cookie_value, proxy=proxy)
                 logger.debug(f"解析完成: {pr}")
+                if pr.fallback_errors:
+                    logger.warning(
+                        "解析成功, 但前面的回退层失败: "
+                        + "; ".join(f"{a.name}: {a.error}" for a in pr.fallback_errors)
+                    )
+                if cookie_value:
+                    if failed := _cookie_failure(pr):
+                        cookie_health.record_failure(p.id, cookie_value, failed.error, url)
+                    else:
+                        cookie_health.record_success(cookie_value)
                 return pr
             except Exception as e:
                 logger.warning(f"解析失败, attempt={attempt}/{max_retries}, err={e}")
+                if isinstance(e, ContentUnavailableError):
+                    raise
+                if cookie_value and _used_cookie(e):
+                    cookie_health.record_failure(p.id, cookie_value, e, url)
                 if attempt >= max_retries:
-                    raise Exception(e) from e
+                    raise
         raise
+
+    async def test_cookie(self, url: str, cookie: str) -> None:
+        """用指定 cookie 解析一次, 结果计入该 cookie 的统计"""
+        p = self.get_platform(url)
+        try:
+            pr = await self.parser.parse(url, cookie=cookie, proxy=pl_cfg.roll_parser_proxy(p.id))
+        except Exception as e:
+            if _used_cookie(e):
+                cookie_health.record_failure(p.id, cookie, e, url, alert=False)
+            raise
+        if failed := _cookie_failure(pr):
+            cookie_health.record_failure(p.id, cookie, failed.error, url, alert=False)
+            raise failed.error
+        cookie_health.record_success(cookie)
 
     async def get_raw_url(self, url: str, clean_all: bool = True) -> str:
         p = self.get_platform(url)
@@ -61,5 +103,5 @@ class ParseService:
             except Exception as e:
                 logger.warning(f"获取原始 URL 失败, attempt={attempt}/{max_retries}, err={e}")
                 if attempt >= max_retries:
-                    raise Exception(e) from e
+                    raise
         raise

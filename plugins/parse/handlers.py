@@ -1,5 +1,6 @@
 import asyncio
 import re
+from collections.abc import Awaitable
 from dataclasses import replace
 
 from parsehub.types import AniRef, RichTextParseResult
@@ -20,7 +21,16 @@ from plugins.filters import (
 from plugins.helpers import build_caption, create_richtext_telegraph, format_label
 from plugins.parse.context import GIF_ONLY_SKIP_DOWNLOAD_COUNT_THRESHOLD, ParseOptions, ParseRequest
 from plugins.parse.reporters import MessageStatusReporter, disable_progress_on_report_forbidden
-from plugins.parse.sender import MessageSender, build_gif_button, send_cached, send_media, send_raw, send_zip
+from plugins.parse.rich import build_rich_media_blocks, is_rich_media_result, rich_caption_blocks
+from plugins.parse.sender import (
+    MessageSender,
+    build_gif_button,
+    send_cached,
+    send_media,
+    send_raw,
+    send_rich_media,
+    send_zip,
+)
 from repo.settings import ParseMode
 from services import CacheEntry, CacheParseResult, ParsePipeline, ParseService, SettingsService, UserService
 from services.cache import parse_cache, persistent_cache
@@ -28,6 +38,20 @@ from utils.helpers import to_list, with_request_id
 from utils.rate_limit import ParseRateLimitExceeded, parse_rate_limit
 
 logger = logger.bind(name="Parse")
+
+_bg: set[asyncio.Task[None]] = set()
+
+
+def _on_done(task: asyncio.Task[None]) -> None:
+    _bg.discard(task)
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        logger.opt(exception=exc).error("后台解析任务异常")
+
+
+def spawn(coro: Awaitable[None]) -> None:
+    task = asyncio.ensure_future(coro)
+    _bg.add(task)
+    task.add_done_callback(_on_done)
 
 
 @Client.on_message(
@@ -89,23 +113,22 @@ async def parse(cli: Client, msg: Message) -> None:
         items: list[str] = [m.group(2) for m in re.finditer(r"^(={2})(.*?)\1", raw_text, flags=re.S | re.M)]
         custom_content = items[0].strip() if items else ""
 
-    tasks = [
-        _handle_parse_request(
-            ParseRequest(
-                cli=cli,
-                msg=msg,
-                url=url,
-                mode=mode,
-                config=config,
-                t_=_t,
-                bypass_cache=bypass_cache,
-                delete_share_url_msg=config.auto_delete_url,
-                custom_content=custom_content,
+    for url in urls:
+        spawn(
+            _handle_parse_request(
+                ParseRequest(
+                    cli=cli,
+                    msg=msg,
+                    url=url,
+                    mode=mode,
+                    config=config,
+                    t_=_t,
+                    bypass_cache=bypass_cache,
+                    delete_share_url_msg=config.auto_delete_url,
+                    custom_content=custom_content,
+                )
             )
         )
-        for url in urls
-    ]
-    await asyncio.gather(*tasks)
 
 
 @with_request_id
@@ -225,7 +248,12 @@ async def handle_parse(req: ParseRequest) -> bool:
             # Telegraph 发送
             logger.debug(f"富文本类型, 创建 Telegraph 页面: title={parse_result.title}")
             await sender.typing()
-            ph_url = await create_richtext_telegraph(req.cli, parse_result)
+            try:
+                ph_url = await create_richtext_telegraph(req.cli, parse_result)
+            except Exception as e:
+                logger.exception(e)
+                await reporter.report_error(req.t_("创建 Telegraph 页面"), e)
+                return False
             logger.debug(f"Telegraph 页面创建完成: {ph_url}")
             caption = build_caption(
                 parse_result,
@@ -277,6 +305,43 @@ async def handle_parse(req: ParseRequest) -> bool:
         if req.mode == ParseMode.ZIP:
             await send_zip(sender, result, reporter, _t=req.t_, custom_content=req.custom_content)
             return True
+
+        if req.config.rich_media_mode and is_rich_media_result(parse_result):
+            skip_gifs = (
+                sum(isinstance(m, AniRef) for m in to_list(parse_result.media))
+                > GIF_ONLY_SKIP_DOWNLOAD_COUNT_THRESHOLD
+            )
+            try:
+                blocks = await build_rich_media_blocks(
+                    result, video_cover=req.config.video_cover, skip_gifs=skip_gifs
+                )
+                caption_blocks = rich_caption_blocks(
+                    parse_result.title,
+                    parse_result.content,
+                    raw_url,
+                    req.config,
+                    custom_content=req.custom_content,
+                )
+                media_list = await send_rich_media(sender, blocks, caption_blocks, slideshow=req.config.rich_slideshow)
+            except Exception as e:
+                logger.warning(f"富文本媒体发送失败, 退回常规媒体发送: {e}")
+            else:
+                if skip_gifs:
+                    await sender.text(
+                        format_label(req.t_("GIF 过多跳过上传, 请自行下载")),
+                        reply_markup=build_gif_button(to_list(parse_result.media)),
+                    )
+                elif media_list is not None:
+                    await persistent_cache.set(
+                        raw_url,
+                        CacheEntry(
+                            parse_result=CacheParseResult(title=parse_result.title, content=parse_result.content),
+                            media=media_list,
+                            rich_media=True,
+                        ),
+                    )
+                await reporter.dismiss()
+                return True
 
         logger.debug(f"开始上传媒体: media_count={len(result.processed_list)}")
         await reporter.report(req.t_("上 传 中..."))

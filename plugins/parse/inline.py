@@ -1,3 +1,5 @@
+import os
+import tempfile
 from collections.abc import Sequence
 
 from parsehub import AnyParseResult
@@ -47,11 +49,33 @@ from plugins.parse.reporters import InlineStatusReporter
 from repo.settings import SettingsConfig
 from services import ParseService, SettingsService, UserService
 from services.cache import CacheEntry, CacheMediaType, parse_cache, persistent_cache
-from services.media import resolve_media_info
+from services.media import fetch_thumb, resolve_media_info
 from services.pipeline import ParsePipeline
 from utils.helpers import to_list, with_request_id
 
 logger = logger.bind(name="InlineParse")
+
+
+async def _fetch_video_thumb(video_ref: VideoRef | None) -> str | None:
+    """下载视频封面并转成 thumb 要求的 JPEG（≤320px），失败返回 None
+
+    内联模式用 video_cover 封面会被 TG 丢弃不展示，必须用 thumb 预览图参数。
+    """
+    thumb_url = getattr(video_ref, "thumb_url", None)
+    if not thumb_url:
+        return None
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    tmp.close()
+    try:
+        path = await fetch_thumb(str(thumb_url), tmp.name)
+        if path is None:
+            os.unlink(tmp.name)
+        return path
+    except Exception as e:
+        os.unlink(tmp.name)
+        logger.warning(f"内联视频封面下载失败, 跳过: {e}")
+        return None
+
 
 SEARCH_ICON = "https://i.imgloc.com/2023/06/15/Vbfazk.png"
 DEFAULT_PARSE_RESULT_THUMB_URL = "https://telegra.ph/file/cdfdb65b83a4b7b2b6078.png"
@@ -144,28 +168,21 @@ async def inline_result_download(cli: Client, chosen_result: ChosenInlineResult)
             logger.debug(f"inline 上传文件: {file_path_str}")
             width, height, duration = resolve_media_info(processed, file_path_str)
 
-            video_cover = str(video_ref.thumb_url) if video_ref and video_ref.thumb_url else None
-            media = (
-                InputMediaVideo(
+            thumb_path = await _fetch_video_thumb(video_ref)
+            try:
+                media = InputMediaVideo(
                     file_path_str,
                     caption=caption,
-                    video_cover=video_cover,
+                    thumb=thumb_path,
                     duration=duration or 0,
                     width=width or 0,
                     height=height or 0,
                     supports_streaming=True,
                 )
-                if video_cover
-                else InputMediaVideo(
-                    file_path_str,
-                    caption=caption,
-                    duration=duration or 0,
-                    width=width or 0,
-                    height=height or 0,
-                    supports_streaming=True,
-                )
-            )
-            await cli.edit_inline_media(inline_message_id, media=media)
+                await cli.edit_inline_media(inline_message_id, media=media)
+            finally:
+                if thumb_path:
+                    os.unlink(thumb_path)
         except Exception as e:
             logger.opt(exception=e).debug("详细堆栈")
             logger.error(f"inline 上传失败: {e}")
@@ -215,7 +232,9 @@ def build_cached_inline_results(
                 title=title,
                 input_message_content=InputTextMessageContent(
                     caption,
-                    link_preview_options=LinkPreviewOptions(show_above_text=True),
+                    link_preview_options=LinkPreviewOptions(
+                        url=entry.telegraph_url, show_above_text=True
+                    ),
                 ),
             )
         )
@@ -324,7 +343,7 @@ async def build_inline_results(
                 description=parse_result.content,
                 input_message_content=InputTextMessageContent(
                     caption,
-                    link_preview_options=LinkPreviewOptions(show_above_text=True),
+                    link_preview_options=LinkPreviewOptions(url=url, show_above_text=True),
                 ),
             )
         )
